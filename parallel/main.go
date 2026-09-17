@@ -26,7 +26,68 @@ var (
 	speedPtr *float64 = flag.Float64("speed", 0.3, "speed of particles")
 )
 
-var numWorker int
+type pool struct {
+	numWorkers  int
+	starts      []int
+	ends        []int
+	workSignals []chan struct{}
+	wg          sync.WaitGroup
+}
+
+func newPool(n, numWorkers int) *pool {
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+
+	chunk := (n + numWorkers - 1) / numWorkers
+
+	p := &pool{}
+
+	for w := range numWorkers {
+		start := w * chunk
+		end := start + chunk
+
+		if start >= n {
+			break
+		}
+
+		if end > n {
+			end = n
+		}
+
+		p.starts = append(p.starts, start)
+		p.ends = append(p.ends, end)
+		p.workSignals = append(p.workSignals, make(chan struct{}))
+	}
+	p.numWorkers = len(p.starts)
+
+	return p
+}
+
+func (p *pool) spawn(ps particles, lanes int) {
+	for w := range p.numWorkers {
+		go func(w int) {
+			for range p.workSignals[w] {
+				calcAccelerationRange(ps, lanes, p.starts[w], p.ends[w])
+				p.wg.Done()
+			}
+		}(w)
+	}
+}
+
+func (p *pool) run() {
+	p.wg.Add(p.numWorkers)
+	for w := range p.numWorkers {
+		p.workSignals[w] <- struct{}{}
+	}
+	p.wg.Wait()
+}
+
+func (p *pool) close() {
+	for _, ch := range p.workSignals {
+		close(ch)
+	}
+}
 
 type particles struct {
 	posX, posY []float32
@@ -80,9 +141,9 @@ func createParticles() particles {
 	return ps
 }
 
-func updateSystemSimd(ps particles, lanes int, dt float32) {
+func updateSystemSimd(ps particles, lanes int, dt float32, p *pool) {
 	halfKickDrift(ps, lanes, dt)
-	calcAcceleration(ps, lanes, dt)
+	calcAcceleration(ps, p)
 	halfKick(ps, lanes, dt)
 }
 
@@ -125,36 +186,10 @@ func halfKickDrift(ps particles, lanes int, dt float32) {
 	}
 }
 
-func calcAcceleration(ps particles, lanes int, dt float32) {
+func calcAcceleration(ps particles, p *pool) {
 	clear(ps.accX)
 	clear(ps.accY)
-
-	numWorker = runtime.GOMAXPROCS(0)
-	n := len(ps.posX)
-
-	var wg sync.WaitGroup
-	chunk := (n + numWorker - 1) / numWorker
-
-	for w := 0; w < numWorker; w++ {
-		start := w * chunk
-		end := start + chunk
-
-		if start >= n {
-			break
-		}
-
-		if end > n {
-			end = n
-		}
-
-		wg.Add(1)
-		go func(start, end int) {
-			defer wg.Done()
-			calcAccelerationRange(ps, lanes, start, end)
-		}(start, end)
-	}
-
-	wg.Wait()
+	p.run()
 }
 
 func calcAccelerationRange(ps particles, lanes, start, end int) {
@@ -276,6 +311,12 @@ func main() {
 	var vec simd.Float32s
 	lanes := vec.Len()
 
+	numWorkers := runtime.GOMAXPROCS(0)
+	n := len(particles.posX)
+	pool := newPool(n, numWorkers)
+	pool.spawn(particles, lanes)
+	defer pool.close()
+
 	timer := time.NewTimer(2 * time.Second)
 	var elapsed time.Duration
 
@@ -285,7 +326,7 @@ func main() {
 
 		now := time.Now()
 		for accumulator >= PHYSICS_DT {
-			updateSystemSimd(particles, lanes, PHYSICS_DT)
+			updateSystemSimd(particles, lanes, PHYSICS_DT, pool)
 
 			accumulator -= PHYSICS_DT
 		}
@@ -300,13 +341,13 @@ func main() {
 		rl.BeginDrawing()
 		rl.ClearBackground(rl.Black)
 
-		drawParticles(particles)
+		// drawParticles(particles)
 
 		// rl.DrawCircleLines(int32(rl.GetScreenWidth()/2.0), int32(rl.GetScreenHeight()/2.0), SPAWN_RADIUS, rl.RayWhite)
 
 		rl.DrawText(fmt.Sprintf("simd lanes: %d", lanes), 10, 30, 20, rl.RayWhite)
 		rl.DrawText(fmt.Sprintf("update time: %.1f ms", float64(elapsed.Milliseconds())), 10, 50, 20, rl.RayWhite)
-		rl.DrawText(fmt.Sprintf("number of workers: %d", numWorker), 10, 70, 20, rl.RayWhite)
+		rl.DrawText(fmt.Sprintf("number of workers: %d", numWorkers), 10, 70, 20, rl.RayWhite)
 		rl.DrawFPS(10, 10)
 
 		rl.EndDrawing()
