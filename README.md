@@ -1,1 +1,1 @@
-# gravity-simulation
+# n-body simulation
